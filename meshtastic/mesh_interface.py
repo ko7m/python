@@ -192,47 +192,60 @@ class MeshInterface:  # pylint: disable=R0902
         # For now we just try to format the line as if it had come in over the serial port
         self._handleLogLine(record.message)
 
-    def showInfo(self, file=sys.stdout) -> str:  # pylint: disable=W0613
-        """Show human readable summary about this object"""
-        owner = f"Owner: {self.getLongName()} ({self.getShortName()})"
-        myinfo = ""
-        if self.myInfo:
-            myinfo = f"\nMy info: {message_to_json(self.myInfo)}"
-        metadata = ""
-        if self.metadata:
-            metadata = f"\nMetadata: {message_to_json(self.metadata)}"
-        mesh = "\n\nNodes in mesh: "
+    def showInfo(self, file=sys.stdout, jsonFormat: bool = False):  # pylint: disable=W0613
+        """Show human readable summary about this object.
+
+        When jsonFormat is True, returns a dict (caller assembles final JSON).
+        Otherwise prints text and returns the string.
+        """
         nodes = {}
         if self.nodes:
             for n in self.nodes.values():
-                # when the TBeam is first booted, it sometimes shows the raw data
-                # so, we will just remove any raw keys
                 keys_to_remove = ("raw", "decoded", "payload")
                 n2 = remove_keys_from_dict(keys_to_remove, n)
-
-                # if we have 'macaddr', re-format it
-                if "macaddr" in n2["user"]:
-                    val = n2["user"]["macaddr"]
-                    # decode the base64 value
-                    addr = convert_mac_addr(val)
-                    n2["user"]["macaddr"] = addr
-
-                # use id as dictionary key for correct json format in list of nodes
-                nodeid = n2["user"]["id"]
+                if "macaddr" in n2.get("user", {}):
+                    n2["user"]["macaddr"] = convert_mac_addr(n2["user"]["macaddr"])
+                nodeid = n2.get("user", {}).get("id", "unknown")
                 nodes[nodeid] = n2
-        infos = owner + myinfo + metadata + mesh + json.dumps(nodes, indent=2)
+
+        if jsonFormat:
+            result = {
+                "owner": {
+                    "longName": self.getLongName(),
+                    "shortName": self.getShortName(),
+                },
+                "myInfo": json.loads(message_to_json(self.myInfo)) if self.myInfo else None,
+                "metadata": json.loads(message_to_json(self.metadata)) if self.metadata else None,
+                "nodes": nodes,
+            }
+            return result
+
+        owner = f"Owner: {self.getLongName()} ({self.getShortName()})"
+        myinfo = f"\nMy info: {message_to_json(self.myInfo)}" if self.myInfo else ""
+        metadata = f"\nMetadata: {message_to_json(self.metadata)}" if self.metadata else ""
+        infos = owner + myinfo + metadata + "\n\nNodes in mesh: " + json.dumps(nodes, indent=2)
         print(infos)
         return infos
 
     def showNodes(
-        self, includeSelf: bool = True, showFields: Optional[List[str]] = None
+        self, includeSelf: bool = True, showFields: Optional[List[str]] = None,
+        jsonFormat: bool = False,
     ) -> str:  # pylint: disable=W0613
         """Show table summary of nodes in mesh
 
            Args:
                 includeSelf (bool): Include ourself in the output?
                 showFields (List[str]): List of fields to show in output
+                jsonFormat (bool): Output as JSON instead of a table?
         """
+
+        def sanitize_for_display(value):
+            """Strip control characters and variation selectors that break table alignment.
+            U+FE0E (text presentation) and U+FE0F (emoji presentation) cause wcwidth
+            to undercount display width, misaligning tabulate output."""
+            if isinstance(value, str):
+                return "".join(c for c in value if (c >= " " or c == "\t") and c not in "\ufe0e\ufe0f")
+            return value
 
         def get_human_readable(name):
             name_map = {
@@ -284,7 +297,7 @@ class MeshInterface:  # pylint: disable=R0902
             return _timeago(delta_secs)
 
         def getNestedValue(node_dict: Dict[str, Any], key_path: str) -> Any:
-            if key_path.index(".") < 0:
+            if "." not in key_path:
                 logger.debug("getNestedValue was called without a nested path.")
                 return None
             keys = key_path.split(".")
@@ -364,20 +377,28 @@ class MeshInterface:  # pylint: disable=R0902
                     else:
                         formatted_value = raw_value  # No special formatting
 
-                    fields[field] = formatted_value
+                    fields[field] = sanitize_for_display(formatted_value)
 
-                # Filter out any field in the data set that was not specified.
-                filteredData = {get_human_readable(k): v for k, v in fields.items() if k in showFields}
-                filteredData.update({get_human_readable(k): v for k, v in fields.items()})
-                rows.append(filteredData)
+                if jsonFormat:
+                    rows.append(fields)
+                else:
+                    rows.append({get_human_readable(k): v for k, v in fields.items()})
 
-        rows.sort(key=lambda r: r.get("LastHeard") or "0000", reverse=True)
+        sort_key = "lastHeard" if jsonFormat else "LastHeard"
+        rows.sort(key=lambda r: r.get(sort_key) or "0000", reverse=True)
+
+        n_key = "N"
         for i, row in enumerate(rows):
-            row["N"] = i + 1
+            row[n_key] = i + 1
 
-        table = tabulate(rows, headers="keys", missingval="N/A", tablefmt="fancy_grid")
-        print(table)
-        return table
+        if jsonFormat:
+            output = json.dumps(rows, indent=2, default=str)
+            print(output)
+            return output
+        else:
+            table = tabulate(rows, headers="keys", missingval="N/A", tablefmt="fancy_grid")
+            print(table)
+            return table
 
     def getNode(
         self, nodeId: str, requestChannels: bool = True, requestChannelAttempts: int = 3, timeout: int = 300
@@ -1341,7 +1362,7 @@ class MeshInterface:  # pylint: disable=R0902
             try:
                 newpos = self._fixupPosition(node["position"])
                 node["position"] = newpos
-            except:
+            except (KeyError, TypeError):
                 logger.debug("Node without position")
 
             # no longer necessary since we're mutating directly in nodesByNum via _getOrCreateByNum
@@ -1509,7 +1530,7 @@ class MeshInterface:  # pylint: disable=R0902
 
         try:
             return self.nodesByNum[num]["user"]["id"]  # type: ignore[index]
-        except:
+        except (KeyError, TypeError):
             logger.debug(f"Node {num} not found for fromId")
             return None
 

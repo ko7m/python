@@ -2,6 +2,7 @@
 """
 
 import base64
+import json
 import logging
 import time
 
@@ -75,14 +76,34 @@ class Node:
         except Exception:
             return True
 
-    def showChannels(self):
-        """Show human readable description of our channels."""
+    def showChannels(self, jsonFormat: bool = False):
+        """Show human readable description of our channels.
+
+        When jsonFormat is True, returns a list of channel dicts instead of printing.
+        """
+        if jsonFormat:
+            channels = []
+            if self.channels:
+                for c in self.channels:
+                    role = channel_pb2.Channel.Role.Name(c.role)
+                    if role != "DISABLED":
+                        channels.append({
+                            "index": c.index,
+                            "role": role,
+                            "psk": pskToString(c.settings.psk),
+                            "settings": json.loads(message_to_json(c.settings)),
+                        })
+            return {
+                "channels": channels,
+                "primaryChannelURL": self.getURL(includeAll=False),
+                "completeURL": self.getURL(includeAll=True),
+            }
+
         print("Channels:")
         if self.channels:
             logger.debug(f"self.channels:{self.channels}")
             for c in self.channels:
                 cStr = message_to_json(c.settings)
-                # don't show disabled channels
                 if channel_pb2.Channel.Role.Name(c.role) != "DISABLED":
                     print(
                         f"  Index {c.index}: {channel_pb2.Channel.Role.Name(c.role)} psk={pskToString(c.settings.psk)} {cStr}"
@@ -93,8 +114,20 @@ class Node:
         if adminURL != publicURL:
             print(f"Complete URL (includes all channels): {adminURL}")
 
-    def showInfo(self):
-        """Show human readable description of our node"""
+    def showInfo(self, jsonFormat: bool = False):
+        """Show human readable description of our node.
+
+        When jsonFormat is True, returns a dict instead of printing.
+        """
+        if jsonFormat:
+            result = {}
+            if self.localConfig:
+                result["localConfig"] = json.loads(message_to_json(self.localConfig, multiline=True))
+            if self.moduleConfig:
+                result["moduleConfig"] = json.loads(message_to_json(self.moduleConfig, multiline=True))
+            result.update(self.showChannels(jsonFormat=True))
+            return result
+
         prefs = ""
         if self.localConfig:
             prefs = message_to_json(self.localConfig, multiline=True)
@@ -477,7 +510,11 @@ class Node:
             self._sendAdmin(
                 p1, wantResponse=True, onResponse=self.onResponseRequestRingtone
             )
+            deadline = time.time() + 15
             while self.gotResponse is False:
+                if time.time() > deadline:
+                    logger.warning("Timed out waiting for ringtone response")
+                    return self.ringtone
                 time.sleep(0.1)
 
             logger.debug(f"self.ringtone:{self.ringtone}")
@@ -556,7 +593,11 @@ class Node:
                 wantResponse=True,
                 onResponse=self.onResponseRequestCannedMessagePluginMessageMessages,
             )
+            deadline = time.time() + 15
             while self.gotResponse is False:
+                if time.time() > deadline:
+                    logger.warning("Timed out waiting for canned message response")
+                    return self.cannedPluginMessage
                 time.sleep(0.1)
 
             logger.debug(
@@ -1038,6 +1079,7 @@ class Node:
             nodeid = to_node_num(self.nodeNum)
             if "adminSessionPassKey" in self.iface._getOrCreateByNum(nodeid):
                 p.session_passkey = self.iface._getOrCreateByNum(nodeid).get("adminSessionPassKey")
+            isLocal = self == self.iface.localNode
             return self.iface.sendData(
                 p,
                 self.nodeNum,
@@ -1046,7 +1088,7 @@ class Node:
                 wantResponse=wantResponse,
                 onResponse=onResponse,
                 channelIndex=adminIndex,
-                pkiEncrypted=True,
+                pkiEncrypted=not isLocal,
             )
 
     def ensureSessionKey(self):

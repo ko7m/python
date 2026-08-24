@@ -9,6 +9,7 @@ from typing import List, Optional, Union
 from types import ModuleType
 
 import argparse
+import json
 
 argcomplete: Union[None, ModuleType] = None
 try:
@@ -109,28 +110,32 @@ def checkChannel(interface: MeshInterface, channelIndex: int) -> bool:
     return ch and ch.role != channel_pb2.Channel.Role.DISABLED
 
 
-def getPref(node, comp_name) -> bool:
-    """Get a channel or preferences value"""
-    def _printSetting(config_type, uni_name, pref_value, repeated):
-        """Pretty print the setting"""
+def getPref(node, comp_name, jsonCollector: dict = None) -> bool:
+    """Get a channel or preferences value.
+
+    When jsonCollector is provided, values are added to the dict instead of printed.
+    """
+    def _emitSetting(config_type, uni_name, pref_value, repeated):
         if repeated:
             pref_value = [meshtastic.util.toStr(v) for v in pref_value]
         else:
             pref_value = meshtastic.util.toStr(pref_value)
-        print(f"{str(config_type.name)}.{uni_name}: {str(pref_value)}")
+        key = f"{str(config_type.name)}.{uni_name}"
+        if jsonCollector is not None:
+            jsonCollector[key] = pref_value
+        else:
+            print(f"{key}: {str(pref_value)}")
         logger.debug(f"{str(config_type.name)}.{uni_name}: {str(pref_value)}")
 
     name = splitCompoundName(comp_name)
     wholeField = name[0] == name[1]  # We want the whole field
 
     camel_name = meshtastic.util.snake_to_camel(name[1])
-    # Note: protobufs has the keys in snake_case, so snake internally
     snake_name = meshtastic.util.camel_to_snake(name[1])
     uni_name = camel_name if mt_config.camel_case else snake_name
     logger.debug(f"snake_name:{snake_name} camel_name:{camel_name}")
     logger.debug(f"use camel:{mt_config.camel_case}")
 
-    # First validate the input
     localConfig = node.localConfig
     moduleConfig = node.moduleConfig
     found: bool = False
@@ -153,20 +158,17 @@ def getPref(node, comp_name) -> bool:
         printConfig(moduleConfig)
         return False
 
-    # Check if we need to request the config
-    if len(config.ListFields()) != 0 and not isinstance(pref, str): # if str, it's still the empty string, I think
-        # read the value
+    if len(config.ListFields()) != 0 and not isinstance(pref, str):
         config_values = getattr(config, config_type.name)
         if not wholeField:
             pref_value = getattr(config_values, pref.name)
             repeated = _is_repeated_field(pref)
-            _printSetting(config_type, uni_name, pref_value, repeated)
+            _emitSetting(config_type, uni_name, pref_value, repeated)
         else:
             for field in config_values.ListFields():
                 repeated = _is_repeated_field(field[0])
-                _printSetting(config_type, field[0].name, field[1], repeated)
+                _emitSetting(config_type, field[0].name, field[1], repeated)
     else:
-        # Always show whole field for remote node
         node.requestConfig(config_type)
 
     return True
@@ -305,7 +307,7 @@ def onConnected(interface):
         }
 
         # do not print this line if we are exporting the config
-        if not args.export_config:
+        if not args.export_config and not args.json:
             print("Connected to radio")
 
         if args.set_time is not None:
@@ -937,6 +939,7 @@ def onConnected(interface):
 
         if args.ch_set or args.ch_enable or args.ch_disable:
             closeNow = True
+            enable = True
 
             channelIndex = mt_config.channel_index
             if channelIndex is None:
@@ -1015,20 +1018,25 @@ def onConnected(interface):
             print(f"ringtone:{ringtone}")
 
         if args.info:
-            print("")
-            # If we aren't trying to talk to our local node, don't show it
             if args.dest == BROADCAST_ADDR:
-                interface.showInfo()
-                print("")
-                interface.getNode(args.dest, **getNode_kwargs).showInfo()
+                if args.json:
+                    result = interface.showInfo(jsonFormat=True)
+                    node_info = interface.getNode(args.dest, **getNode_kwargs).showInfo(jsonFormat=True)
+                    result.update(node_info)
+                    print(json.dumps(result, indent=2, default=str))
+                else:
+                    print("")
+                    interface.showInfo()
+                    print("")
+                    interface.getNode(args.dest, **getNode_kwargs).showInfo()
+                    print("")
+                    pypi_version = meshtastic.util.check_if_newer_version()
+                    if pypi_version:
+                        print(
+                            f"*** A newer version v{pypi_version} is available!"
+                            ' Consider running "pip install --upgrade meshtastic" ***\n'
+                        )
                 closeNow = True
-                print("")
-                pypi_version = meshtastic.util.check_if_newer_version()
-                if pypi_version:
-                    print(
-                        f"*** A newer version v{pypi_version} is available!"
-                        ' Consider running "pip install --upgrade meshtastic" ***\n'
-                    )
             else:
                 print("Showing info of remote node is not supported.")
                 print(
@@ -1038,18 +1046,25 @@ def onConnected(interface):
         if args.get:
             closeNow = True
             node = interface.getNode(args.dest, False, **getNode_kwargs)
+            jsonCollector = {} if args.json else None
             for pref in args.get:
-                found = getPref(node, pref[0])
+                found = getPref(node, pref[0], jsonCollector=jsonCollector)
 
             if found:
-                print("Completed getting preferences")
+                if jsonCollector is not None:
+                    print(json.dumps(jsonCollector, indent=2, default=str))
+                else:
+                    print("Completed getting preferences")
 
         if args.nodes:
             closeNow = True
             if args.dest != BROADCAST_ADDR:
                 print("Showing node list of a remote node is not supported.")
                 return
-            interface.showNodes(True, args.show_fields)
+            interface.showNodes(
+                True, args.show_fields,
+                jsonFormat=args.json,
+            )
 
         if args.show_fields and not args.nodes:
             print("--show-fields can only be used with --nodes")
@@ -1258,9 +1273,9 @@ def export_config(interface) -> str:
                     for i in range(len(prefs[pref]['adminKey'])):
                         prefs[pref]['adminKey'][i] = 'base64:' + prefs[pref]['adminKey'][i]
         if mt_config.camel_case:
-            configObj["config"] = config		#Identical command here and 2 lines below?
+            configObj["config"] = prefs
         else:
-            configObj["config"] = config
+            configObj["config"] = prefs
 
         set_missing_flags_false(configObj["config"], config_true_defaults)
 
@@ -1415,6 +1430,7 @@ def common():
                     noProto=args.noproto,
                     noNodes=args.no_nodes,
                     timeout=args.timeout,
+                    blePIN=getattr(args, 'ble_pin', None),
                 )
             elif args.host:
                 try:
@@ -1501,8 +1517,8 @@ def common():
                 except KeyboardInterrupt:
                     logger.info("Exiting due to keyboard interrupt")
 
-        # don't call exit, background threads might be running still
-        # sys.exit(0)
+            if client:
+                client.close()
 
 
 def addConnectionArgs(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -1546,6 +1562,13 @@ def addConnectionArgs(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--ble-scan",
         help="Scan for Meshtastic BLE devices that may be available to connect to",
         action="store_true",
+    )
+
+    outer.add_argument(
+        "--ble-pin",
+        help="BLE pairing PIN (default: prompt, or 123456 if Enter pressed)",
+        type=int,
+        default=None,
     )
 
     return parser
@@ -1876,6 +1899,7 @@ def addLocalActionArgs(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
         default=None
     )
 
+
     return parser
 
 def addRemoteActionArgs(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -2107,6 +2131,12 @@ def initParser():
         "--no-nodes",
         help="Request that the node not send node info to the client. "
         "Will break things that depend on the nodedb, but will speed up startup. Requires 2.3.11+ firmware.",
+        action="store_true",
+    )
+
+    group.add_argument(
+        "--json",
+        help="Output structured data as JSON instead of human-readable text. Applies to --info, --nodes, and --get.",
         action="store_true",
     )
 

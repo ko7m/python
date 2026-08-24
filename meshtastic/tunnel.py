@@ -186,7 +186,7 @@ class Tunnel:
         else:
             logger.warning(
                 f"forwarding unexpected protocol 0x{protocol:02x}, "
-                "src={ipstr(srcaddr)}, dest={ipstr(destAddr)}"
+                f"src={ipstr(srcaddr)}, dest={ipstr(destAddr)}"
             )
 
         return ignore

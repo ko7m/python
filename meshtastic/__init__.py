@@ -228,10 +228,11 @@ def _onTelemetryReceive(iface, asDict):
 
 def _receiveInfoUpdate(iface, asDict):
     if "from" in asDict:
-        iface._getOrCreateByNum(asDict["from"])["lastReceived"] = asDict
-        iface._getOrCreateByNum(asDict["from"])["lastHeard"] = asDict.get("rxTime")
-        iface._getOrCreateByNum(asDict["from"])["snr"] = asDict.get("rxSnr")
-        iface._getOrCreateByNum(asDict["from"])["hopLimit"] = asDict.get("hopLimit")
+        node = iface._getOrCreateByNum(asDict["from"])
+        node["lastReceived"] = asDict
+        node["lastHeard"] = asDict.get("rxTime")
+        node["snr"] = asDict.get("rxSnr")
+        node["hopLimit"] = asDict.get("hopLimit")
 
 def _onAdminReceive(iface, asDict):
     """Special auto parsing for received messages"""

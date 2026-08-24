@@ -3,6 +3,8 @@
 import asyncio
 import atexit
 import logging
+import platform
+import re
 import struct
 import sys
 import time
@@ -26,6 +28,110 @@ LEGACY_LOGRADIO_UUID = "6c6fd238-78fa-436b-aacf-15c5be1ef2e2"
 LOGRADIO_UUID = "5a3d6e49-06e6-4423-9944-e9de8cdf9547"
 logger = logging.getLogger(__name__)
 
+_IS_LINUX = platform.system() == 'Linux'
+_HAS_BLUEZ_AGENT = False
+
+if _IS_LINUX:
+    try:
+        from dbus_fast.aio import MessageBus
+        from dbus_fast.constants import BusType, MessageType
+        from dbus_fast.message import Message
+        from dbus_fast.service import ServiceInterface, dbus_method
+        _HAS_BLUEZ_AGENT = True
+    except ImportError:
+        pass
+
+if _HAS_BLUEZ_AGENT:
+    class BluezPairingAgent(ServiceInterface):
+        """BlueZ D-Bus pairing agent that handles PIN entry for BLE devices."""
+
+        AGENT_PATH = '/com/meshtastic/agent'
+
+        def __init__(self, pin=None):
+            super().__init__('org.bluez.Agent1')
+            self._pin = pin
+            self._bus = None
+
+        @dbus_method(name='Release')
+        def release(self) -> None:
+            logger.debug("Pairing agent released")
+
+        @dbus_method(name='RequestPasskey')
+        async def request_passkey(self, device: 'o') -> 'u':
+            logger.debug(f"RequestPasskey called for {device}")
+            if self._pin is not None:
+                logger.info(f"Using provided BLE PIN")
+                return self._pin
+            pin_str = await asyncio.to_thread(
+                input, "Enter BLE pairing PIN from device (default 123456): "
+            )
+            pin_str = pin_str.strip()
+            return int(pin_str) if pin_str else 123456
+
+        @dbus_method(name='DisplayPasskey')
+        def display_passkey(self, device: 'o', passkey: 'u') -> None:
+            print(f"BLE pairing passkey: {passkey:06d}")
+
+        @dbus_method(name='RequestConfirmation')
+        def request_confirmation(self, device: 'o', passkey: 'u') -> None:
+            print(f"Confirming BLE pairing passkey: {passkey:06d}")
+
+        @dbus_method(name='Cancel')
+        def cancel(self) -> None:
+            logger.debug("Pairing cancelled")
+
+        @dbus_method(name='AuthorizeService')
+        def authorize_service(self, device: 'o', uuid: 's') -> None:
+            logger.debug(f"Authorizing service {uuid} for {device}")
+
+        async def register(self):
+            """Register this agent with BlueZ on the system D-Bus."""
+            self._bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            self._bus.export(self.AGENT_PATH, self)
+
+            reply = await self._bus.call(Message(
+                destination='org.bluez',
+                path='/org/bluez',
+                interface='org.bluez.AgentManager1',
+                member='RegisterAgent',
+                signature='os',
+                body=[self.AGENT_PATH, 'KeyboardDisplay'],
+            ))
+            if reply.message_type == MessageType.ERROR:
+                logger.warning(f"Failed to register pairing agent: {reply.body}")
+                self._bus.disconnect()
+                self._bus = None
+                return False
+
+            await self._bus.call(Message(
+                destination='org.bluez',
+                path='/org/bluez',
+                interface='org.bluez.AgentManager1',
+                member='RequestDefaultAgent',
+                signature='o',
+                body=[self.AGENT_PATH],
+            ))
+            logger.info("BLE pairing agent registered")
+            return True
+
+        async def unregister(self):
+            """Unregister the agent and close the D-Bus connection."""
+            if self._bus:
+                try:
+                    await self._bus.call(Message(
+                        destination='org.bluez',
+                        path='/org/bluez',
+                        interface='org.bluez.AgentManager1',
+                        member='UnregisterAgent',
+                        signature='o',
+                        body=[self.AGENT_PATH],
+                    ))
+                except Exception:
+                    pass
+                self._bus.disconnect()
+                self._bus = None
+            logger.debug("BLE pairing agent unregistered")
+
 
 class BLEInterface(MeshInterface):
     """MeshInterface using BLE to connect to devices."""
@@ -40,12 +146,15 @@ class BLEInterface(MeshInterface):
         debugOut: Optional[io.TextIOWrapper]=None,
         noNodes: bool = False,
         timeout: int = 300,
+        blePIN: Optional[int] = None,
     ) -> None:
         MeshInterface.__init__(
             self, debugOut=debugOut, noProto=noProto, noNodes=noNodes, timeout=timeout
         )
 
         self.should_read = False
+        self._closing = False
+        self._blePIN = blePIN
 
         logger.debug("Threads starting")
         self._want_receive = True
@@ -87,7 +196,7 @@ class BLEInterface(MeshInterface):
         self._exit_handler = atexit.register(self.client.disconnect)
 
     def __repr__(self):
-        rep = f"BLEInterface(address={self.client.address if self.client else None!r}"
+        rep = f"BLEInterface(address={(self.client.address if self.client else None)!r}"
         if self.debugOut is not None:
             rep += f", debugOut={self.debugOut!r}"
         if self.noProto:
@@ -172,14 +281,20 @@ class BLEInterface(MeshInterface):
         else:
             return address.replace("-", "").replace("_", "").replace(":", "").lower()
 
+    _MAC_RE = re.compile(r'^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$')
+
     def connect(self, address: Optional[str] = None) -> "BLEClient":
         "Connect to a device by address."
 
-        # Bleak docs recommend always doing a scan before connecting (even if we know addr)
+        if address and self._MAC_RE.match(address):
+            logger.info(f"Connecting directly to {address} (skipping scan)")
+            client = BLEClient(address, ble_pin=self._blePIN, disconnected_callback=lambda _: self.close())
+            client.connect()
+            return client
+
         device = self.find_device(address)
-        client = BLEClient(device.address, disconnected_callback=lambda _: self.close())
+        client = BLEClient(device.address, ble_pin=self._blePIN, disconnected_callback=lambda _: self.close())
         client.connect()
-        client.discover()
         return client
 
     def _receiveFromRadioImpl(self) -> None:
@@ -195,22 +310,27 @@ class BLEInterface(MeshInterface):
                     try:
                         b = bytes(self.client.read_gatt_char(FROMRADIO_UUID))
                     except BleakDBusError as e:
-                        # Device disconnected probably, so end our read loop immediately
                         logger.debug(f"Device disconnected, shutting down {e}")
                         self._want_receive = False
                     except BleakError as e:
-                        # We were definitely disconnected
                         if "Not connected" in str(e):
                             logger.debug(f"Device disconnected, shutting down {e}")
                             self._want_receive = False
                         else:
                             raise BLEInterface.BLEError("Error reading BLE") from e
                     if not b:
-                        if retries < 5:
+                        if self.should_read:
+                            # FROMNUM notification arrived during read cycle --
+                            # reset retries so we don't miss the new data.
+                            self.should_read = False
+                            retries = 0
+                            continue
+                        if retries < 10:
                             time.sleep(0.1)
                             retries += 1
                             continue
                         break
+                    retries = 0
                     logger.debug(f"FROMRADIO read: {b.hex()}")
                     self._handleFromRadio(b)
             else:
@@ -234,17 +354,19 @@ class BLEInterface(MeshInterface):
             self.should_read = True
 
     def close(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
+
         try:
             MeshInterface.close(self)
         except Exception as e:
             logger.error(f"Error closing mesh interface: {e}")
 
         if self._want_receive:
-            self._want_receive = False  # Tell the thread we want it to stop
+            self._want_receive = False
             if self._receiveThread:
-                self._receiveThread.join(
-                    timeout=2
-                )  # If bleak is hung, don't wait for the thread to exit (it is critical we disconnect)
+                self._receiveThread.join(timeout=2)
                 self._receiveThread = None
 
         if self.client:
@@ -252,13 +374,13 @@ class BLEInterface(MeshInterface):
             self.client.disconnect()
             self.client.close()
             self.client = None
-        self._disconnected() # send the disconnected indicator up to clients
+        self._disconnected()
 
 
 class BLEClient:
     """Client for managing connection to a BLE device"""
 
-    def __init__(self, address=None, **kwargs) -> None:
+    def __init__(self, address=None, ble_pin=None, **kwargs) -> None:
         self._loop_ready = Event()
         self._eventLoop = asyncio.new_event_loop()
         self._eventThread = Thread(
@@ -267,11 +389,25 @@ class BLEClient:
         self._eventThread.start()
         self._loop_ready.wait()  # Wait for event loop to be running
 
+        self._agent = None
+        if _HAS_BLUEZ_AGENT and address:
+            agent = BluezPairingAgent(pin=ble_pin)
+            try:
+                if self.async_await(agent.register(), timeout=5):
+                    self._agent = agent
+            except Exception as e:
+                logger.warning(f"Could not register BLE pairing agent: {e}")
+
         if not address:
             logger.debug("No address provided - only discover method will work.")
             return
 
         self.bleak_client = BleakClient(address, **kwargs)
+
+    @property
+    def address(self):
+        """Return the address of the connected device."""
+        return self.bleak_client.address if hasattr(self, 'bleak_client') else None
 
     def discover(self, **kwargs):  # pylint: disable=C0116
         return self.async_await(BleakScanner.discover(**kwargs))
@@ -299,6 +435,12 @@ class BLEClient:
         self.async_await(self.bleak_client.start_notify(*args, **kwargs))
 
     def close(self):  # pylint: disable=C0116
+        if self._agent:
+            try:
+                self.async_await(self._agent.unregister(), timeout=5)
+            except Exception:
+                pass
+            self._agent = None
         self.async_run(self._stop_event_loop())
         self._eventThread.join()
 
